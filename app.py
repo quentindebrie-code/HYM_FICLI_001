@@ -1438,42 +1438,45 @@ def deconnecter() -> None:
         st.session_state.pop(cle, None)
 
 
-def bande_sept_jours(rappels: pd.DataFrame, prefixe: str) -> None:
-    """Sept prochains jours, au-dessus de la file d'appel.
+def bande_rappels(rappels: pd.DataFrame, prefixe: str, nombre_jours: int = 7) -> None:
+    """Prochains rappels, au-dessus de la file d'appel.
 
-    Format volontairement compact : les commerciales travaillent à la semaine,
-    et cette bande ne doit pas repousser l'outil qu'elles utilisent réellement
-    hors de l'écran. Cliquer sur un jour filtre la file sur ses rappels.
+    Cinq cases par ligne pour la vue à quinze jours des commerciales ; la vue
+    à sept jours des autres comptes conserve sa ligne unique. Cliquer sur un
+    jour filtre la file sur ses rappels.
     """
     aujourdhui = dt.date.today()
     compte = rappels.groupby("date_rappel").size().to_dict() if not rappels.empty else {}
     retard = sum(n for j, n in compte.items() if j < aujourdhui)
 
-    entete = "**Vos sept prochains jours**"
+    entete = f"**Vos {nombre_jours} prochains jours**"
     if retard:
         entete += "  ·  :red[" + str(retard) + " rappel(s) en retard]"
     st.markdown(entete)
 
-    colonnes = st.columns(7)
-    for i, col in enumerate(colonnes):
-        jour = aujourdhui + dt.timedelta(days=i)
-        n = int(compte.get(jour, 0))
-        classes = "cal-case " + _classe_charge(n, jour) + (" aujourdhui" if i == 0 else "")
-        col.markdown(
-            "<div class='" + classes + "'>"
-            "<div class='j'>" + JOURS_SEMAINE[jour.weekday()] + "</div>"
-            "<div class='d'>" + str(jour.day) + "</div>"
-            "<div class='n'>" + (str(n) if n else "—") + "</div></div>",
-            unsafe_allow_html=True,
-        )
-        col.button(
-            "Voir" if n else "—",
-            key=prefixe + "_" + jour.isoformat(),
-            disabled=(n == 0),
-            width="stretch",
-            on_click=choisir_file_rappel,
-            args=(jour.isoformat(),),
-        )
+    par_ligne = 5 if nombre_jours > 7 else nombre_jours
+    for debut in range(0, nombre_jours, par_ligne):
+        colonnes = st.columns(min(par_ligne, nombre_jours - debut))
+        for position, col in enumerate(colonnes):
+            i = debut + position
+            jour = aujourdhui + dt.timedelta(days=i)
+            n = int(compte.get(jour, 0))
+            classes = "cal-case " + _classe_charge(n, jour) + (" aujourdhui" if i == 0 else "")
+            col.markdown(
+                "<div class='" + classes + "'>"
+                "<div class='j'>" + JOURS_SEMAINE[jour.weekday()] + "</div>"
+                "<div class='d'>" + str(jour.day) + "</div>"
+                "<div class='n'>" + (str(n) if n else "—") + "</div></div>",
+                unsafe_allow_html=True,
+            )
+            col.button(
+                "Voir" if n else "—",
+                key=prefixe + "_" + jour.isoformat(),
+                disabled=(n == 0),
+                width="stretch",
+                on_click=choisir_file_rappel,
+                args=(jour.isoformat(),),
+            )
 
     if retard:
         st.button(
@@ -2365,11 +2368,11 @@ if not acces_direct and PEUT_TRAITER and onglet_actif == ONGLET_APPELS:
 # ── ONGLETS DE TRAVAIL (commerciales et administrateur) ──────────────────────
 if PEUT_TRAITER:
     if onglet_actif == ONGLET_APPELS:
-        # Calendrier de la semaine, replié par défaut pour ne pas repousser
-        # la fiche hors de l'écran.
-        with st.expander("🗓️ Mes rappels des sept prochains jours",
+        # La fenêtre de quinze jours est réservée aux comptes commerciaux.
+        duree_rappels = 15 if UTILISATEUR in COMMERCIALES else 7
+        with st.expander(f"🗓️ Mes rappels des {duree_rappels} prochains jours",
                          expanded=not st.session_state.get("jour_rappel")):
-            bande_sept_jours(mon_calendrier, "bande")
+            bande_rappels(mon_calendrier, "bande", duree_rappels)
 
         if st.session_state.get("jour_rappel"):
             choix = st.session_state.jour_rappel
