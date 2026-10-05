@@ -1,0 +1,7 @@
+.git
+__pycache__
+*.pyc
+.streamlit/secrets.toml
+suivi_appels.db*
+sauvegardes/
+diag_app.py
