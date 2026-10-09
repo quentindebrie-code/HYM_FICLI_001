@@ -1918,7 +1918,7 @@ if coffre["contenu"] is None:
 
 def ecran_connexion() -> None:
     """Chargement des fichiers, puis choix du profil et mot de passe."""
-    st.title("Mise à jour base client • Objectif 01/09/2927")
+    st.title("Mise à jour base client • Objectif 01/09/2027")
 
     # ── Étape 1 : les trois fichiers ─────────────────────────────────────────
     if coffre["contenu"] is None or not coffre["restaure"]:
