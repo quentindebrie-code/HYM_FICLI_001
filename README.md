@@ -35,6 +35,39 @@ La variable d'environnement `HYMPYR_DATABASE_URL` peut remplacer
   mémoire ;
 - les exports restent disponibles, mais ne sont plus le mécanisme de reprise.
 
+## Travail à deux sur la même base
+
+Les deux commerciales peuvent travailler en même temps sans se marcher dessus :
+
+- chaque fiche porte un **numéro de version** (colonne `version`, ajoutée
+  automatiquement au premier démarrage) ; un enregistrement n'est accepté que si
+  la fiche n'a pas changé depuis son ouverture à l'écran. Sinon il est refusé
+  avec un message clair, **sans rien écraser**, et un bouton « Recharger la
+  fiche » réaffiche l'état en base ;
+- la fiche affichée est suivie **par son code**, pas par son numéro d'ordre dans
+  la file : quand l'autre commerciale ouvre ou traite une fiche, la vôtre ne
+  change pas sous vos doigts, et « Enregistrer & passer au suivant » ne saute
+  plus une fiche ;
+- une sauvegarde CSV rechargée sur une base déjà alimentée **ne remplace jamais**
+  une fiche existante : elle ne comble que les fiches absentes. L'écrasement
+  intégral n'a lieu que sur une base vide ;
+- le bouton « Charger d'autres fichiers » n'agit plus que sur la session qui
+  clique.
+
+Connexion Supabase : l'URL peut pointer le pooler en mode transaction (port 6543)
+ou la connexion directe ; le pilote n'utilise pas de requêtes préparées pour rester
+compatible avec les deux.
+
+## Tests
+
+```bash
+pip install -r requirements.txt pytest
+pytest tests -q
+```
+
+Les tests lancent l'application complète avec plusieurs sessions simultanées sur
+une base SQLite jetable (aucun accès à la base de production).
+
 ## Vérifications après déploiement
 
 1. Valider une fiche client et un point de livraison.

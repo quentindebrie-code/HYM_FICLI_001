@@ -371,7 +371,11 @@ def pool_postgresql():
         max_idle=300,
         max_lifetime=1800,
         reconnect_timeout=8,
-        kwargs={"connect_timeout": 8},
+        # prepare_threshold=None : psycopg prépare sinon automatiquement les
+        # requêtes répétées, ce que le pooler en mode transaction de Supabase
+        # (port 6543) ne supporte pas toujours — erreurs intermittentes sur les
+        # enregistrements. Sans effet sur une connexion directe.
+        kwargs={"connect_timeout": 8, "prepare_threshold": None},
         open=True,
     )
 
@@ -534,8 +538,8 @@ def initialiser_base() -> bool:
         """)
         # Migrations sur base existante.
         for table, colonnes in (
-            ("suivi", ("motif_sortie", "rappel_date", "traite_par")),
-            ("suivi_adresses", ("traite_par",)),
+            ("suivi", ("motif_sortie", "rappel_date", "traite_par", "version")),
+            ("suivi_adresses", ("traite_par", "version")),
         ):
             existantes = set(colonnes_table(con, table))
             for c in colonnes:
@@ -680,20 +684,44 @@ CHAMPS_PROTEGES = ("existe", "produits", "email_maj", "tel_maj", "note",
 CHAMPS_PROTEGES_ADR = ("referent", "tel_site", "note_adr")
 
 
+class ConflitEnregistrement(Exception):
+    """La fiche a été modifiée par quelqu'un d'autre depuis son ouverture.
+
+    `actuel` contient l'état en base au moment du refus : rien n'a été écrit.
+    """
+
+    def __init__(self, actuel: dict):
+        super().__init__("Fiche modifiée depuis son ouverture")
+        self.actuel = actuel
+
+
+def numero_version(valeur) -> int:
+    """Numéro de version d'une fiche ; 0 pour une fiche jamais enregistrée ou antérieure au suivi."""
+    try:
+        return int(str(valeur).strip() or 0)
+    except ValueError:
+        return 0
+
+
+def _lire_ligne(con, table: str, colonne_cle: str, code: str) -> dict:
+    """Ligne courante d'une fiche, lue dans la transaction en cours."""
+    curseur = executer(con, f"SELECT * FROM {table} WHERE {colonne_cle}=?", (str(code),))
+    ligne = curseur.fetchone()
+    if not ligne:
+        return {}
+    colonnes = [description[0] for description in curseur.description]
+    return {c: (v if v is not None else "") for c, v in zip(colonnes, ligne)}
+
+
 def lire_fiche(code: str) -> dict:
     """État actuel d'une fiche en base, ou dictionnaire vide si elle n'existe pas."""
     with connexion() as con:
-        colonnes = colonnes_table(con, "suivi")
-        ligne = executer(con, "SELECT * FROM suivi WHERE code_client=?", (str(code),)).fetchone()
-    return {c: (v if v is not None else "") for c, v in zip(colonnes, ligne)} if ligne else {}
+        return _lire_ligne(con, "suivi", "code_client", code)
 
 
 def lire_fiche_adresse(code: str) -> dict:
     with connexion() as con:
-        colonnes = colonnes_table(con, "suivi_adresses")
-        ligne = executer(con, "SELECT * FROM suivi_adresses WHERE code_adresse=?",
-                         (str(code),)).fetchone()
-    return {c: (v if v is not None else "") for c, v in zip(colonnes, ligne)} if ligne else {}
+        return _lire_ligne(con, "suivi_adresses", "code_adresse", code)
 
 
 def _fusionner(existant: dict, champs: dict, proteges: tuple, effacements: Iterable[str]) -> dict:
@@ -714,55 +742,100 @@ def _fusionner(existant: dict, champs: dict, proteges: tuple, effacements: Itera
     return fusion
 
 
+def _ecrire_fiche(table: str, colonne_cle: str, type_fiche: str, code: str,
+                  utilisateur: str, champs: dict, proteges: tuple,
+                  effacements: Iterable[str], version_attendue: int | None,
+                  creer_seulement: bool) -> int | None:
+    """Lecture, contrôle et écriture d'une fiche dans UNE transaction.
+
+    Chaque fiche porte un numéro de version, incrémenté à chaque écriture.
+    `version_attendue` est celui que l'utilisatrice avait sous les yeux à
+    l'ouverture (0 si la fiche n'existait pas encore). Si la base en contient un
+    autre, quelqu'un l'a modifiée entre-temps : on refuse plutôt que d'écraser
+    son travail avec un formulaire périmé. Le contrôle est répété dans la
+    clause WHERE de l'écriture, car deux enregistrements simultanés peuvent
+    passer la lecture ensemble : un seul des deux modifiera la ligne.
+
+    `version_attendue=None` désactive le contrôle (imports, restaurations).
+    `creer_seulement` n'écrit que si la fiche est absente de la base.
+    Retourne le nouveau numéro de version, ou None si rien n'a été écrit.
+    """
+    effacements = list(effacements or ())
+    with connexion() as con:
+        existant = _lire_ligne(con, table, colonne_cle, code)
+        if creer_seulement and existant:
+            return None
+        courante = numero_version(existant.get("version"))
+        if version_attendue is not None and courante != version_attendue:
+            raise ConflitEnregistrement(existant)
+
+        champs = _fusionner(existant, champs, proteges, effacements)
+        champs[colonne_cle] = str(code)
+        if utilisateur or "traite_par" in effacements:
+            champs["traite_par"] = utilisateur
+        champs["maj_le"] = maintenant_iso()
+        champs["version"] = str(courante + 1)
+
+        cols = ",".join(champs)
+        ph = ",".join("?" for _ in champs)
+        modifiables = [k for k in champs if k != colonne_cle]
+        if version_attendue is None:
+            upd = ",".join(f"{k}=excluded.{k}" for k in modifiables)
+            executer(con,
+                f"INSERT INTO {table} ({cols}) VALUES ({ph}) "
+                f"ON CONFLICT({colonne_cle}) DO UPDATE SET {upd}",
+                list(champs.values()),
+            )
+        elif existant:
+            affectations = ",".join(f"{k}=?" for k in modifiables)
+            curseur = executer(con,
+                f"UPDATE {table} SET {affectations} "
+                f"WHERE {colonne_cle}=? AND COALESCE(NULLIF(version,''),'0')=?",
+                [champs[k] for k in modifiables] + [str(code), str(version_attendue)],
+            )
+            if curseur.rowcount != 1:
+                raise ConflitEnregistrement(_lire_ligne(con, table, colonne_cle, code))
+        else:
+            curseur = executer(con,
+                f"INSERT INTO {table} ({cols}) VALUES ({ph}) "
+                f"ON CONFLICT({colonne_cle}) DO NOTHING",
+                list(champs.values()),
+            )
+            if curseur.rowcount != 1:
+                raise ConflitEnregistrement(_lire_ligne(con, table, colonne_cle, code))
+        _historiser(con, utilisateur, type_fiche, code, champs)
+    return courante + 1
+
+
 def enregistrer(code: str, utilisateur: str, effacements: Iterable[str] = (),
-                invalider_cache: bool = True, **champs) -> None:
+                invalider_cache: bool = True, version_attendue: int | None = None,
+                creer_seulement: bool = False, **champs) -> int | None:
     """Enregistre une fiche sans jamais perdre une information déjà saisie.
 
     Les champs listés dans `effacements` sont les seuls que l'on accepte de
     vider. Passer effacements=CHAMPS_PROTEGES rend l'écriture intégrale, ce que
     fait la restauration d'une sauvegarde : elle doit faire foi.
+
+    Lève ConflitEnregistrement si `version_attendue` ne correspond plus à la base.
     """
-    champs = _fusionner(lire_fiche(code), champs, CHAMPS_PROTEGES, effacements)
-    champs["code_client"] = str(code)
-    if utilisateur or "traite_par" in effacements:
-        champs["traite_par"] = utilisateur
-    champs["maj_le"] = maintenant_iso()
-    cols = ",".join(champs)
-    ph = ",".join("?" for _ in champs)
-    upd = ",".join(f"{k}=excluded.{k}" for k in champs if k != "code_client")
-    with connexion() as con:
-        executer(con,
-            f"INSERT INTO suivi ({cols}) VALUES ({ph}) "
-            f"ON CONFLICT(code_client) DO UPDATE SET {upd}",
-            list(champs.values()),
-        )
-        _historiser(con, utilisateur, "client", code, champs)
-    if invalider_cache:
+    maj = _ecrire_fiche("suivi", "code_client", "client", code, utilisateur, champs,
+                        CHAMPS_PROTEGES, effacements, version_attendue, creer_seulement)
+    if invalider_cache and maj is not None:
         invalider_etat_courant()
+    return maj
 
 
 def enregistrer_adresse(code_adresse: str, utilisateur: str,
                         effacements: Iterable[str] = (),
-                        invalider_cache: bool = True, **champs) -> None:
+                        invalider_cache: bool = True, version_attendue: int | None = None,
+                        creer_seulement: bool = False, **champs) -> int | None:
     """Même protection que pour les fiches clients."""
-    champs = _fusionner(lire_fiche_adresse(code_adresse), champs,
-                        CHAMPS_PROTEGES_ADR, effacements)
-    champs["code_adresse"] = str(code_adresse)
-    if utilisateur or "traite_par" in effacements:
-        champs["traite_par"] = utilisateur
-    champs["maj_le"] = maintenant_iso()
-    cols = ",".join(champs)
-    ph = ",".join("?" for _ in champs)
-    upd = ",".join(f"{k}=excluded.{k}" for k in champs if k != "code_adresse")
-    with connexion() as con:
-        executer(con,
-            f"INSERT INTO suivi_adresses ({cols}) VALUES ({ph}) "
-            f"ON CONFLICT(code_adresse) DO UPDATE SET {upd}",
-            list(champs.values()),
-        )
-        _historiser(con, utilisateur, "adresse", code_adresse, champs)
-    if invalider_cache:
+    maj = _ecrire_fiche("suivi_adresses", "code_adresse", "adresse", code_adresse,
+                        utilisateur, champs, CHAMPS_PROTEGES_ADR, effacements,
+                        version_attendue, creer_seulement)
+    if invalider_cache and maj is not None:
         invalider_etat_courant()
+    return maj
 
 
 def nb_modifs_depuis_export() -> int:
@@ -873,9 +946,11 @@ def reattribuer(code: str, traitant: str, statut: str, auteur: str, ancien: dict
     """
     with connexion() as con:
         executer(con,
-            "INSERT INTO suivi (code_client, statut, traite_par, maj_le) VALUES (?,?,?,?) "
+            "INSERT INTO suivi (code_client, statut, traite_par, maj_le, version) "
+            "VALUES (?,?,?,?,'1') "
             "ON CONFLICT(code_client) DO UPDATE SET "
-            "statut=excluded.statut, traite_par=excluded.traite_par, maj_le=excluded.maj_le",
+            "statut=excluded.statut, traite_par=excluded.traite_par, maj_le=excluded.maj_le, "
+            "version=CAST(CAST(COALESCE(NULLIF(suivi.version,''),'0') AS INTEGER)+1 AS TEXT)",
             (str(code), statut, traitant, maintenant_iso()),
         )
         _historiser(con, auteur, "client", code, {
@@ -997,7 +1072,12 @@ def lire_csv_robuste(fichier) -> pd.DataFrame:
     return pd.read_csv(io.StringIO(texte), sep=sep, dtype=str).fillna("")
 
 
-def importer_suivi_clients_csv(fichier) -> int:
+def importer_suivi_clients_csv(fichier, creer_seulement: bool = False) -> tuple[int, int]:
+    """Restaure le suivi clients depuis un CSV. Retourne (écrites, ignorées).
+
+    `creer_seulement=True` ne crée que les fiches absentes de la base : une
+    sauvegarde plus ancienne ne doit jamais écraser des saisies plus récentes.
+    """
     df = lire_csv_robuste(fichier)
     m = {
         "code_client":  trouver_colonne(df.columns, "code_client", "code client"),
@@ -1022,17 +1102,18 @@ def importer_suivi_clients_csv(fichier) -> int:
         # l'export : ils ne doivent pas revenir en base comme un nom de personne.
         return "" if brut in LIBELLES_VIDES else brut
 
-    n = 0
+    n = ignorees = 0
     for _, ligne in df.iterrows():
         code = val(ligne, "code_client")
         if not code:
             continue
         produits = val(ligne, "produits").replace(";", ",")
         produits = "|".join(x.strip() for x in produits.split(",") if x.strip())
-        enregistrer(
+        ecrite = enregistrer(
             code,
             utilisateur=val(ligne, "traite_par"),   # on conserve l'auteur d'origine
             invalider_cache=False,                   # une seule invalidation après l'import
+            creer_seulement=creer_seulement,
             # La restauration fait foi : elle réécrit la fiche telle qu'exportée,
             # y compris les champs vides.
             effacements=CHAMPS_PROTEGES + ("traite_par",),
@@ -1046,11 +1127,16 @@ def importer_suivi_clients_csv(fichier) -> int:
             note=val(ligne, "note"),
             rappel_date=vers_iso(val(ligne, "rappel_date")),
         )
-        n += 1
-    return n
+        if ecrite is not None:
+            n += 1
+        else:
+            ignorees += 1
+    invalider_etat_courant()
+    return n, ignorees
 
 
-def importer_suivi_adresses_csv(fichier) -> int:
+def importer_suivi_adresses_csv(fichier, creer_seulement: bool = False) -> tuple[int, int]:
+    """Même principe que pour les clients. Retourne (écrits, ignorés)."""
     df = lire_csv_robuste(fichier)
     m = {
         "code_adresse": trouver_colonne(df.columns, "code_adresse", "code adresse"),
@@ -1068,7 +1154,7 @@ def importer_suivi_adresses_csv(fichier) -> int:
         brut = str(ligne[col]).strip() if col else ""
         return "" if brut in LIBELLES_VIDES else brut
 
-    n = 0
+    n = ignorees = 0
     for _, ligne in df.iterrows():
         code = val(ligne, "code_adresse")
         if not code:
@@ -1079,18 +1165,23 @@ def importer_suivi_adresses_csv(fichier) -> int:
         if not any(val(ligne, c) for c in ("referent", "tel_site", "note_adr", "traite_par")) \
                 and val(ligne, "statut_adr") in ("", "À vérifier"):
             continue
-        enregistrer_adresse(
+        ecrit = enregistrer_adresse(
             code,
             utilisateur=val(ligne, "traite_par"),
             invalider_cache=False,
+            creer_seulement=creer_seulement,
             effacements=CHAMPS_PROTEGES_ADR + ("traite_par",),
             referent=val(ligne, "referent"),
             tel_site=val(ligne, "tel_site"),
             statut_adr=val(ligne, "statut_adr") or "À vérifier",
             note_adr=val(ligne, "note_adr"),
         )
-        n += 1
-    return n
+        if ecrit is not None:
+            n += 1
+        else:
+            ignorees += 1
+    invalider_etat_courant()
+    return n, ignorees
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1386,29 +1477,129 @@ MOIS_LONGS = ["janvier", "février", "mars", "avril", "mai", "juin",
               "juillet", "août", "septembre", "octobre", "novembre", "décembre"]
 
 
-def deplacer_index(cle: str, pas: int, maximum: int | None = None,
-                   minimum: int | None = 0) -> None:
+def deplacer_index(cle: str, pas: int) -> None:
     """Callback exécuté avant le rerun naturel du bouton.
 
     Cela évite le second `st.rerun()` qui doublait le temps d'attente de tous
-    les boutons Précédent/Suivant.
+    les boutons Précédent/Suivant. Le déplacement est mémorisé en RELATIF : la
+    file est recalculée à chaque exécution, et son contenu bouge dès que l'autre
+    commerciale enregistre ou ouvre une fiche. La position de départ est donc
+    retrouvée par le code de la fiche ouverte (voir position_ancree), jamais
+    par un numéro d'ordre qui peut désigner un autre client entre-temps.
     """
-    valeur = int(st.session_state.get(cle, 0)) + pas
-    if minimum is not None:
-        valeur = max(minimum, valeur)
-    if maximum is not None:
-        valeur = min(valeur, maximum)
-    st.session_state[cle] = valeur
+    st.session_state[cle + "_pas"] = int(st.session_state.get(cle + "_pas", 0)) + pas
+
+
+def position_ancree(codes: list[str], cle_idx: str, cle_ancre: str) -> int:
+    """Position dans la file de la fiche que l'utilisatrice a sous les yeux.
+
+    Sans cet ancrage, `idx` était un simple numéro d'ordre : si une fiche située
+    avant la sienne quittait la file (l'autre commerciale la traitait ou
+    l'ouvrait), le même numéro désignait un autre client. Le formulaire changeait
+    sous ses doigts, son clic sur « Enregistrer » tombait sur un formulaire
+    différent et la saisie était perdue sans message.
+    """
+    pas = int(st.session_state.pop(cle_idx + "_pas", 0))
+    ancre = st.session_state.get(cle_ancre)
+    position = codes.index(ancre) if ancre in codes else int(st.session_state.get(cle_idx, 0))
+    position = max(0, min(position + pas, len(codes) - 1))
+    st.session_state[cle_idx] = position
+    st.session_state[cle_ancre] = codes[position]
+    return position
+
+
+def epingler_fiche_ouverte(file: pd.DataFrame, source: pd.DataFrame, col_code: str,
+                           cle_ancre: str, signature: tuple) -> pd.DataFrame:
+    """Réintègre la fiche ouverte si elle a quitté la file sans que les filtres changent.
+
+    Si c'est l'utilisatrice qui change un filtre, la file doit suivre ce filtre.
+    Si les filtres sont identiques à ceux de l'exécution précédente et que la
+    fiche a disparu, c'est que quelqu'un d'autre l'a ouverte ou traitée : elle
+    reste affichée jusqu'à ce que l'utilisatrice passe à une autre. Le contrôle
+    de version à l'enregistrement protège alors le travail de l'autre personne.
+    """
+    ancre = st.session_state.get(cle_ancre)
+    precedente = st.session_state.get(cle_ancre + "_signature")
+    libre = st.session_state.pop(cle_ancre + "_libre", False)
+    st.session_state[cle_ancre + "_signature"] = signature
+    if not ancre or libre or precedente != signature:
+        return file
+    if (file[col_code].astype(str) == ancre).any():
+        return file
+    manquante = source[source[col_code].astype(str) == ancre]
+    return pd.concat([file, manquante]) if not manquante.empty else file
+
+
+def avancer_apres_enregistrement(codes: list[str], position: int,
+                                 cle_idx: str, cle_ancre: str) -> None:
+    """Désigne la fiche suivante AVANT que l'enregistrement ne modifie la file.
+
+    La fiche qu'on vient de traiter quitte souvent la file (filtre « Non
+    traité ») : avancer d'un rang après coup faisait sauter une fiche sur deux.
+    """
+    if position + 1 < len(codes):
+        st.session_state[cle_ancre] = codes[position + 1]
+        st.session_state[cle_idx] = position + 1
+    else:
+        # Dernière fiche : on reste dessus, sans l'épingler si elle quitte la file.
+        st.session_state[cle_ancre + "_libre"] = True
+
+
+def texte_propre(valeur) -> str:
+    """Chaîne vide pour None/NaN, texte sinon (les jointures laissent des NaN)."""
+    return "" if valeur is None or (not isinstance(valeur, str) and pd.isna(valeur)) else str(valeur)
+
+
+def memoriser_version(cle: str, code: str, version_vue: int) -> int:
+    """Version de la fiche telle qu'elle était à l'ouverture, conservée tant qu'on y reste."""
+    memo = st.session_state.get(cle)
+    if not memo or memo[0] != code:
+        memo = (code, version_vue)
+        st.session_state[cle] = memo
+    return memo[1]
+
+
+def recharger_fiche(cle_version: str, code: str, prefixes: tuple[str, ...]) -> None:
+    """Abandonne la saisie en cours et réaffiche l'état enregistré en base."""
+    for prefixe in prefixes:
+        st.session_state.pop(f"{prefixe}_{code}", None)
+    st.session_state.pop(cle_version, None)
+    invalider_etat_courant()
+
+
+PREFIXES_WIDGETS_CLIENT = ("statut", "existe", "produits", "email", "tel", "doublon",
+                           "motif", "rappel", "suppr_rappel", "note", "effacer")
+PREFIXES_WIDGETS_ADRESSE = ("referent", "tel_site", "statut_adr", "note_adr", "effacer_adr")
+
+
+def avertir_fiche_modifiee(cle_version: str, code: str, version_ouverte: int,
+                           version_actuelle: int, modifie_le: str, qui: str,
+                           prefixes: tuple[str, ...], libelle: str) -> bool:
+    """Prévient si la fiche a changé en base depuis son ouverture. True si oui."""
+    if version_actuelle == version_ouverte:
+        return False
+    st.warning(
+        f"⚠️ Ce {libelle} a été modifié"
+        + (f" par **{qui}**" if qui else "")
+        + f" le {jolie_date(modifie_le, True)}, après son ouverture sur votre écran. "
+        "Le formulaire ci-dessous peut être périmé : rechargez-le avant de saisir, "
+        "sinon l'enregistrement sera refusé pour ne pas écraser ce travail."
+    )
+    st.button("🔄 Recharger la fiche", key=f"recharger_{cle_version}_{code}",
+              on_click=recharger_fiche, args=(cle_version, code, prefixes))
+    return True
 
 
 def choisir_file_rappel(valeur: str) -> None:
     st.session_state.jour_rappel = valeur
     st.session_state.pop("idx", None)
+    st.session_state.pop("code_ancre", None)
 
 
 def quitter_file_speciale(cle: str) -> None:
     st.session_state.pop(cle, None)
     st.session_state.pop("idx", None)
+    st.session_state.pop("code_ancre", None)
 
 
 def terminer_demo() -> None:
@@ -1432,7 +1623,8 @@ def ouvrir_demo() -> None:
 
 
 def deconnecter() -> None:
-    for cle in ("utilisateur", "role", "idx", "idx_adr", "demo_active",
+    for cle in ("utilisateur", "role", "idx", "idx_adr", "code_ancre", "code_ancre_adr",
+                "_version_fiche", "_version_adresse", "demo_active",
                 "demo_etape", "saut_code", "jour_rappel", "cal_decalage",
                 "grille_jour_detail", "bande_jour_detail", "navigation_principale"):
         st.session_state.pop(cle, None)
@@ -1891,17 +2083,19 @@ coffre = coffre_fichier()
 def confirmer_reprise_base() -> None:
     """Valide la reprise avant le rerun déclenché par le bouton Streamlit."""
     coffre["restaure"] = True
+    st.session_state.pop("forcer_import", None)
 
 
 def demander_autres_fichiers() -> None:
-    """Revient à l'upload sans déclencher la restauration automatique.
+    """Revient à l'upload pour CETTE session uniquement.
 
-    Le classeur courant reste disponible tant que son remplaçant n'a pas été
-    validé. Mettre ``contenu`` à ``None`` le faisait auparavant recharger depuis
-    PostgreSQL au rerun suivant, ce qui renvoyait aussitôt à la connexion.
+    `coffre` est partagé par toutes les sessions du processus : y baisser le
+    drapeau « restaure » renvoyait aussi l'autre commerciale vers l'écran
+    d'import à sa prochaine reconnexion, où recharger une ancienne sauvegarde
+    pouvait écraser le travail récent. Le classeur courant reste disponible
+    tant que son remplaçant n'a pas été validé.
     """
-    coffre["restaure"] = False
-    coffre["clients"] = None
+    st.session_state["forcer_import"] = True
     st.session_state.pop("reprendre_base_existante", None)
     for cle in ("up_mere", "up_suivi", "up_refs"):
         st.session_state.pop(cle, None)
@@ -1921,7 +2115,7 @@ def ecran_connexion() -> None:
     st.title("Mise à jour base client • Objectif 01/09/2027")
 
     # ── Étape 1 : les trois fichiers ─────────────────────────────────────────
-    if coffre["contenu"] is None or not coffre["restaure"]:
+    if coffre["contenu"] is None or not coffre["restaure"] or st.session_state.get("forcer_import"):
         st.subheader("1. Charger les fichiers de travail")
         st.caption(
             "Au premier démarrage, chargez le fichier clients et, si elles existent, les deux "
@@ -1948,8 +2142,9 @@ def ecran_connexion() -> None:
             reprendre = st.checkbox(
                 f"La base contient déjà {formater_entier(nb)} fiche(s) — reprendre sans restaurer les sauvegardes",
                 key="reprendre_base_existante",
-                help="À cocher uniquement si le travail en cours est déjà dans l'outil. "
-                     "Restaurer une sauvegarde plus ancienne écraserait les saisies récentes.",
+                help="À cocher si le travail en cours est déjà dans l'outil. Sans cette case, "
+                     "les sauvegardes ne servent qu'à compléter les fiches absentes de la base : "
+                     "elles n'écrasent jamais une fiche déjà saisie.",
             )
 
         pret = (f_mere is not None or deja_charge) and (reprendre or (f_suivi is not None and f_refs is not None))
@@ -1972,12 +2167,17 @@ def ecran_connexion() -> None:
                     enregistrer_fichier_maitre(
                         coffre["nom"], coffre["contenu"]
                     )
-                messages = [
-                    f"{importer_suivi_clients_csv(f_suivi)} fiches clients restaurées",
-                    f"{importer_suivi_adresses_csv(f_refs)} référents restaurés",
-                ]
+                # Base déjà alimentée : une sauvegarde est forcément plus ancienne que
+                # les saisies en base, elle ne doit donc rien écraser.
+                n_cli, ign_cli = importer_suivi_clients_csv(f_suivi, creer_seulement=base_non_vide)
+                n_ref, ign_ref = importer_suivi_adresses_csv(f_refs, creer_seulement=base_non_vide)
+                messages = [f"{n_cli} fiches clients restaurées", f"{n_ref} référents restaurés"]
+                if ign_cli or ign_ref:
+                    messages.append(
+                        f"{ign_cli + ign_ref} fiche(s) déjà présentes en base conservées telles quelles")
                 ecrire_meta("dernier_export", maintenant_iso())
                 coffre["restaure"] = True
+                st.session_state.pop("forcer_import", None)
                 st.cache_data.clear()
                 st.success("✅ " + " · ".join(messages))
                 st.rerun()
@@ -2070,7 +2270,7 @@ suivi, suivi_adr, modifs_en_attente, compteurs_appels = charger_etat_courant()
 
 base = clients.merge(suivi, left_on=col_code, right_on="code_client", how="left")
 for c in ["statut", "existe", "produits", "email_maj", "tel_maj", "note",
-          "doublon_de", "rappel_date", "motif_sortie", "traite_par"]:
+          "doublon_de", "rappel_date", "motif_sortie", "traite_par", "maj_le", "version"]:
     base[c] = base[c].fillna("") if c in base.columns else ""
 base["statut"] = base["statut"].replace("", "À appeler")
 base["priorite"] = base["Type client"].map(priorite)
@@ -2229,7 +2429,7 @@ with st.sidebar:
             if st.button("🗑️ Tout réinitialiser",
                          disabled=not (confirme and mot_confirm.strip().upper() == "RESET")):
                 reinitialiser_tout(UTILISATEUR)
-                for cle in ("idx", "idx_adr"):
+                for cle in ("idx", "idx_adr", "code_ancre", "code_ancre_adr"):
                     st.session_state.pop(cle, None)
                 st.cache_data.clear()
                 st.success("Suivi réinitialisé.")
@@ -2357,6 +2557,11 @@ if not acces_direct and PEUT_TRAITER and onglet_actif == ONGLET_APPELS:
             | file_appel["Raison sociale / Nom"].str.lower().str.contains(r, na=False)
             | file_appel["Ville"].str.lower().str.contains(r, na=False)
         ]
+    file_appel = epingler_fiche_ouverte(
+        file_appel, base, col_code, "code_ancre",
+        (tuple(f_traitement), f_masquer_ouvertes, tuple(f_type), tuple(f_statut),
+         f_acompl, recherche, tri_priorite),
+    )
     tri = ["priorite", "Raison sociale / Nom"] if tri_priorite else ["Raison sociale / Nom"]
     file_appel = file_appel.sort_values(tri).reset_index(drop=True)
 
@@ -2410,16 +2615,18 @@ if PEUT_TRAITER:
                 derniere = lire_meta(f"derniere_fiche_{UTILISATEUR}", "")
                 positions = file_appel.index[file_appel[col_code].astype(str) == derniere].tolist()
                 st.session_state.idx = positions[0] if positions else 0
-            st.session_state.idx = max(0, min(st.session_state.idx, len(file_appel) - 1))
+                st.session_state.pop("code_ancre", None)
+            codes_file = file_appel[col_code].astype(str).tolist()
+            position_courante = position_ancree(codes_file, "idx", "code_ancre")
 
             nav1, nav2, nav3 = st.columns([1, 2, 1])
             nav1.button(
                 "⬅️ Précédent", width="stretch", on_click=deplacer_index,
-                args=("idx", -1, len(file_appel) - 1),
+                args=("idx", -1),
             )
             nav3.button(
                 "Suivant ➡️", width="stretch", on_click=deplacer_index,
-                args=("idx", 1, len(file_appel) - 1),
+                args=("idx", 1),
             )
             nav2.markdown(
                 f"<div style='text-align:center;font-weight:600;color:{VERT}'>"
@@ -2427,9 +2634,13 @@ if PEUT_TRAITER:
                 unsafe_allow_html=True,
             )
 
-            ligne = file_appel.iloc[st.session_state.idx]
+            ligne = file_appel.iloc[position_courante]
             code = str(ligne[col_code])
             marquer_presence("client", code, UTILISATEUR)
+            # Version de la fiche au moment où elle est apparue à l'écran : c'est
+            # elle que l'enregistrement exigera de retrouver en base.
+            version_ouverte = memoriser_version("_version_fiche", code,
+                                                numero_version(texte_propre(ligne.get("version"))))
 
             # Bandeau si quelqu'un d'autre est sur la même fiche.
             for qui, minutes in autres_sur_la_fiche("client", code, UTILISATEUR):
@@ -2479,7 +2690,7 @@ if PEUT_TRAITER:
                     + f"<span style='color:#5a6b62'>Code {code}</span>",
                     unsafe_allow_html=True,
                 )
-                if ligne.get("maj_le"):
+                if texte_propre(ligne.get("maj_le")):
                     st.caption(f"Dernière mise à jour : {jolie_date(ligne['maj_le'], True)}")
 
                 adresse = " ".join(x for x in [ligne.get("Adresse 1", ""), ligne.get("Adresse 2", ""),
@@ -2519,6 +2730,11 @@ if PEUT_TRAITER:
 
             with droite:
                 st.markdown("#### Résultat de l'appel")
+                avertir_fiche_modifiee(
+                    "_version_fiche", code, version_ouverte,
+                    numero_version(texte_propre(ligne.get("version"))),
+                    texte_propre(ligne.get("maj_le")), texte_propre(ligne.get("traite_par")),
+                    PREFIXES_WIDGETS_CLIENT, "client")
                 produits_init = [p for p in str(ligne.get("produits") or "").split("|") if p in PRODUITS]
                 rappel_init = None
                 if ligne.get("rappel_date"):
@@ -2605,8 +2821,9 @@ if PEUT_TRAITER:
                         if supprimer_rappel:
                             effacements.append("rappel_date")
                         try:
-                            enregistrer(
+                            nouvelle_version = enregistrer(
                                 code, UTILISATEUR, effacements=effacements,
+                                version_attendue=version_ouverte,
                                 statut=statut, existe=existe,
                                 produits="|".join(produits),
                                 email_maj=email_maj.strip(), tel_maj=tel_maj.strip(),
@@ -2616,6 +2833,20 @@ if PEUT_TRAITER:
                             )
                             journaliser_appel(UTILISATEUR, "client", code, statut)
                             sauvegarde_auto()
+                        except ConflitEnregistrement as conflit:
+                            invalider_etat_courant()
+                            LOGGER.warning("Conflit d'enregistrement sur le client %s (modifié par %s)",
+                                           code, conflit.actuel.get("traite_par") or "?")
+                            st.error(
+                                "❌ Enregistrement refusé : cette fiche a été modifiée par "
+                                f"**{conflit.actuel.get('traite_par') or 'quelqu’un'}** "
+                                f"le {jolie_date(conflit.actuel.get('maj_le'), True)}, "
+                                "après son ouverture sur votre écran. Rien n'a été écrasé. "
+                                "Rechargez la fiche pour voir son état actuel, puis refaites votre saisie."
+                            )
+                            st.button("🔄 Recharger la fiche", key=f"recharger_conflit_{code}",
+                                      on_click=recharger_fiche,
+                                      args=("_version_fiche", code, PREFIXES_WIDGETS_CLIENT))
                         except Exception:
                             LOGGER.exception("Échec d'enregistrement du client %s", code)
                             st.error(
@@ -2623,7 +2854,9 @@ if PEUT_TRAITER:
                                 "attendez quelques secondes puis réessayez."
                             )
                         else:
-                            st.session_state.idx = min(len(file_appel) - 1, st.session_state.idx + 1)
+                            # Même fiche réaffichée (accès direct) : la version à exiger est la nôtre.
+                            st.session_state["_version_fiche"] = (code, nouvelle_version)
+                            avancer_apres_enregistrement(codes_file, position_courante, "idx", "code_ancre")
                             st.rerun()
 
                 # ── Réattribution manuelle, réservée à l'administrateur ──────
@@ -2684,7 +2917,7 @@ if PEUT_TRAITER:
             st.caption("Prolongement de l'appel : pour chaque site livré, qui est le référent sur place ?")
 
             adr = adresses.merge(suivi_adr, left_on="Code adresse", right_on="code_adresse", how="left")
-            for c in ["referent", "tel_site", "statut_adr", "note_adr", "traite_par"]:
+            for c in ["referent", "tel_site", "statut_adr", "note_adr", "traite_par", "maj_le", "version"]:
                 adr[c] = adr[c].fillna("") if c in adr.columns else ""
             adr["statut_adr"] = adr["statut_adr"].replace("", "À vérifier")
 
@@ -2698,6 +2931,7 @@ if PEUT_TRAITER:
             q_mere = rech2.text_input("🔎 ou Code client mère (montre tous ses points)")
 
             vue = adr.copy()
+            filtre_adr, filtre_qui = [], []
             if q_adr.strip():
                 vue = vue[vue["Code adresse"].astype(str).str.upper() == q_adr.strip().upper()]
             elif q_mere.strip():
@@ -2722,6 +2956,10 @@ if PEUT_TRAITER:
                         for m in masques[1:]:
                             garde = garde | m
                         vue = vue[garde]
+            vue = epingler_fiche_ouverte(
+                vue, adr, "Code adresse", "code_ancre_adr",
+                (q_adr.strip(), q_mere.strip(), tuple(filtre_adr), tuple(filtre_qui)),
+            )
             vue = vue.reset_index(drop=True)
 
             if vue.empty:
@@ -2729,26 +2967,30 @@ if PEUT_TRAITER:
             else:
                 if "idx_adr" not in st.session_state:
                     st.session_state.idx_adr = 0
-                st.session_state.idx_adr = max(0, min(st.session_state.idx_adr, len(vue) - 1))
+                    st.session_state.pop("code_ancre_adr", None)
+                codes_vue = vue["Code adresse"].astype(str).tolist()
+                position_adr = position_ancree(codes_vue, "idx_adr", "code_ancre_adr")
 
                 n1, n2, n3 = st.columns([1, 2, 1])
                 n1.button(
                     "⬅️ Précédent", key="adr_prev", width="stretch",
-                    on_click=deplacer_index, args=("idx_adr", -1, len(vue) - 1),
+                    on_click=deplacer_index, args=("idx_adr", -1),
                 )
                 n3.button(
                     "Suivant ➡️", key="adr_next", width="stretch",
-                    on_click=deplacer_index, args=("idx_adr", 1, len(vue) - 1),
+                    on_click=deplacer_index, args=("idx_adr", 1),
                 )
                 n2.markdown(
                     f"<div style='text-align:center;font-weight:600;color:{VERT}'>"
-                    f"Point {st.session_state.idx_adr + 1} / {len(vue)}</div>",
+                    f"Point {position_adr + 1} / {len(vue)}</div>",
                     unsafe_allow_html=True,
                 )
 
-                point = vue.iloc[st.session_state.idx_adr]
+                point = vue.iloc[position_adr]
                 code_adr = str(point["Code adresse"])
                 marquer_presence("adresse", code_adr, UTILISATEUR)
+                version_adr = memoriser_version("_version_adresse", code_adr,
+                                                numero_version(texte_propre(point.get("version"))))
 
                 for qui, minutes in autres_sur_la_fiche("adresse", code_adr, UTILISATEUR):
                     st.markdown(
@@ -2777,6 +3019,11 @@ if PEUT_TRAITER:
                     )
                 with d:
                     st.markdown("#### Référent du site")
+                    avertir_fiche_modifiee(
+                        "_version_adresse", code_adr, version_adr,
+                        numero_version(texte_propre(point.get("version"))),
+                        texte_propre(point.get("maj_le")), texte_propre(point.get("traite_par")),
+                        PREFIXES_WIDGETS_ADRESSE, "point de livraison")
                     with st.form(f"adr_form_{code_adr}"):
                         referent = st.text_input("Nom du référent sur place",
                                                  value=point.get("referent") or "", key=f"referent_{code_adr}")
@@ -2803,14 +3050,29 @@ if PEUT_TRAITER:
                         corresp_adr = {"Référent sur place": "referent",
                                        "Téléphone du site": "tel_site", "Note": "note_adr"}
                         try:
-                            enregistrer_adresse(
+                            nouvelle_version_adr = enregistrer_adresse(
                                 code_adr, UTILISATEUR,
                                 effacements=[corresp_adr[x] for x in a_effacer_adr],
+                                version_attendue=version_adr,
                                 referent=referent.strip(), tel_site=tel_site.strip(),
                                 statut_adr=statut_adr, note_adr=note_adr.strip(),
                             )
                             journaliser_appel(UTILISATEUR, "adresse", code_adr, statut_adr)
                             sauvegarde_auto()
+                        except ConflitEnregistrement as conflit:
+                            invalider_etat_courant()
+                            LOGGER.warning("Conflit d'enregistrement sur le point %s (modifié par %s)",
+                                           code_adr, conflit.actuel.get("traite_par") or "?")
+                            st.error(
+                                "❌ Enregistrement refusé : ce point a été modifié par "
+                                f"**{conflit.actuel.get('traite_par') or 'quelqu’un'}** "
+                                f"le {jolie_date(conflit.actuel.get('maj_le'), True)}, "
+                                "après son ouverture sur votre écran. Rien n'a été écrasé. "
+                                "Rechargez la fiche, puis refaites votre saisie."
+                            )
+                            st.button("🔄 Recharger la fiche", key=f"recharger_conflit_adr_{code_adr}",
+                                      on_click=recharger_fiche,
+                                      args=("_version_adresse", code_adr, PREFIXES_WIDGETS_ADRESSE))
                         except Exception:
                             LOGGER.exception("Échec d'enregistrement du point %s", code_adr)
                             st.error(
@@ -2818,7 +3080,8 @@ if PEUT_TRAITER:
                                 "attendez quelques secondes puis réessayez."
                             )
                         else:
-                            st.session_state.idx_adr = min(len(vue) - 1, st.session_state.idx_adr + 1)
+                            st.session_state["_version_adresse"] = (code_adr, nouvelle_version_adr)
+                            avancer_apres_enregistrement(codes_vue, position_adr, "idx_adr", "code_ancre_adr")
                             st.rerun()
 
 
