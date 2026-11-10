@@ -55,6 +55,7 @@ from typing import Iterable
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 try:
     import psycopg
@@ -229,6 +230,43 @@ st.markdown(
 </style>
 """,
     unsafe_allow_html=True,
+)
+
+# Streamlit sert sa page avec lang="en" : Chrome propose alors (ou applique
+# automatiquement) sa traduction « anglais → français ». La traduction réécrit
+# les nœuds texte du DOM derrière React, qui plante ensuite au rendu suivant avec
+# « NotFoundError: Failed to execute 'removeChild' on 'Node' ». On déclare donc
+# la page en français et non traduisible, sur le document parent de l'iframe.
+components.html(
+    """
+<script>
+  (function () {
+    try {
+      const doc = window.parent.document;
+      doc.documentElement.setAttribute("lang", "fr");
+      doc.documentElement.setAttribute("translate", "no");
+      doc.documentElement.classList.add("notranslate");
+      if (doc.body) {
+        doc.body.setAttribute("translate", "no");
+        doc.body.classList.add("notranslate");
+      }
+      if (!doc.querySelector('meta[name="google"][content="notranslate"]')) {
+        const meta = doc.createElement("meta");
+        meta.name = "google";
+        meta.content = "notranslate";
+        doc.head.appendChild(meta);
+      }
+      // Masque l'iframe vide qui porte ce script.
+      if (window.frameElement) {
+        const bloc = window.frameElement.closest('[data-testid="stElementContainer"]')
+          || window.frameElement;
+        bloc.style.display = "none";
+      }
+    } catch (e) { /* document parent inaccessible : rien à faire */ }
+  })();
+</script>
+""",
+    height=0,
 )
 
 
